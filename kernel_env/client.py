@@ -47,40 +47,30 @@ class KernelEnv(
     def _step_payload(self, action: KernelAction) -> Dict:
         """
         Convert KernelAction to JSON payload for step message.
-
-        Args:
-            action: KernelAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
         """
         return {
-            "message": action.message,
+            "command": action.command,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[KernelObservation]:
         """
         Parse server response into StepResult[KernelObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with KernelObservation
         """
         obs_data = payload.get("observation", {})
         observation = KernelObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            normalized_message=obs_data.get("normalized_message", ""),
+            stdout=obs_data.get("stdout", ""),
+            stderr=obs_data.get("stderr", ""),
+            exit_code=obs_data.get("exit_code", 0),
+            system_state=obs_data.get("system_state", {}),
+            tasks_status=obs_data.get("tasks_status", {}),
             done=payload.get("done", False),
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             metadata=obs_data.get("metadata", {}),
         )
 
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
+            reward=payload.get("reward", 0.0),
             done=payload.get("done", False),
         )
 

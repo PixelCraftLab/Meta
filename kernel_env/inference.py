@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import time
+import asyncio
 from typing import Any, Dict, List
 from openai import OpenAI
 
@@ -33,86 +34,87 @@ def get_llm_response(client: OpenAI, prompt: str) -> str:
     )
     return response.choices[0].message.content.strip()
 
-def run_inference():
-    # Initialize OpenAI client with HF Token (if applicable)
+async def run_inference():
+    # Initialize OpenAI client
     client = OpenAI(
         base_url=API_BASE_URL,
         api_key=HF_TOKEN,
     )
 
     # Initialize Environment
-    # We assume the environment is running locally or at a provided URL
-    # For the hackathon evaluation, it will likely be at localhost:8000
     env_url = os.environ.get("ENV_URL", "http://localhost:8000")
-    env = KernelEnv(base_url=env_url)
-
-    try:
-        # Reset Environment
-        observation = env.reset()
-        episode_id = observation.metadata.get("episode_id", str(uuid.uuid4()))
-        
-        # [START] Logging
-        start_log = {
-            "episode_id": episode_id,
-            "timestamp": time.time(),
-            "tasks": observation.tasks_status,
-        }
-        print(f"[START] {json.dumps(start_log)}")
-
-        done = False
-        step_count = 0
-        total_reward = 0.0
-
-        while not done and step_count < 15:
-            step_count += 1
+    
+    # EnvClient is async, must be used with async context manager or manually closed
+    async with KernelEnv(base_url=env_url) as env:
+        try:
+            # Reset Environment (must be awaited)
+            result = await env.reset()
+            observation = result.observation
+            episode_id = observation.metadata.get("episode_id", str(uuid.uuid4()))
             
-            # Construct Prompt
-            prompt = (
-                f"Current Tasks: {observation.tasks_status}\n"
-                f"System State: {observation.system_state}\n"
-                f"Last stdout: {observation.stdout}\n"
-                f"Last stderr: {observation.stderr}\n"
-                f"Exit code: {observation.exit_code}\n\n"
-                "What is your next command?"
-            )
-            
-            # Get Action from LLM
-            command = get_llm_response(client, prompt)
-            
-            # Execute Step
-            observation = env.step(KernelAction(command=command))
-            reward = observation.reward
-            total_reward += reward
-            done = observation.done
-            
-            # [STEP] Logging
-            step_log = {
-                "step": step_count,
-                "command": command,
-                "stdout": observation.stdout,
-                "stderr": observation.stderr,
-                "exit_code": observation.exit_code,
-                "reward": reward,
-                "done": done,
-                "tasks_status": observation.tasks_status,
+            # [START] Logging
+            start_log = {
+                "episode_id": episode_id,
+                "timestamp": time.time(),
+                "tasks": observation.tasks_status,
             }
-            print(f"[STEP] {json.dumps(step_log)}")
-            
-        # [END] Logging
-        end_log = {
-            "episode_id": episode_id,
-            "total_reward": round(total_reward, 4),
-            "steps": step_count,
-            "success": all(observation.tasks_status.values()),
-        }
-        print(f"[END] {json.dumps(end_log)}")
+            print(f"[START] {json.dumps(start_log)}")
 
-    finally:
-        env.close()
+            done = False
+            step_count = 0
+            total_reward = 0.0
+
+            while not done and step_count < 15:
+                step_count += 1
+                
+                # Construct Prompt
+                prompt = (
+                    f"Current Tasks: {observation.tasks_status}\n"
+                    f"System State: {observation.system_state}\n"
+                    f"Last stdout: {observation.stdout}\n"
+                    f"Last stderr: {observation.stderr}\n"
+                    f"Exit code: {observation.exit_code}\n\n"
+                    "What is your next command?"
+                )
+                
+                # Get Action from LLM (LLM client is sync in this example)
+                command = get_llm_response(client, prompt)
+                
+                # Execute Step (must be awaited)
+                result = await env.step(KernelAction(command=command))
+                observation = result.observation
+                reward = result.reward
+                total_reward += reward
+                done = result.done
+                
+                # [STEP] Logging
+                step_log = {
+                    "step": step_count,
+                    "command": command,
+                    "stdout": observation.stdout,
+                    "stderr": observation.stderr,
+                    "exit_code": observation.exit_code,
+                    "reward": reward,
+                    "done": done,
+                    "tasks_status": observation.tasks_status,
+                }
+                print(f"[STEP] {json.dumps(step_log)}")
+                
+            # [END] Logging
+            end_log = {
+                "episode_id": episode_id,
+                "total_reward": round(total_reward, 4),
+                "steps": step_count,
+                "success": all(observation.tasks_status.values()),
+            }
+            print(f"[END] {json.dumps(end_log)}")
+
+        except Exception as e:
+            print(f"Error during inference: {e}")
+            raise e
 
 if __name__ == "__main__":
     if not all([API_BASE_URL, MODEL_NAME, HF_TOKEN]):
-        print("Missing required environment variables: API_BASE_URL, MODEL_NAME, HF_TOKEN")
-        # For local testing, we might want to exit or provide defaults
-        # sys.exit(1)
-    run_inference()
+        print("Warning: Missing required environment variables (API_BASE_URL, MODEL_NAME, HF_TOKEN)")
+    
+    asyncio.run(run_inference())
