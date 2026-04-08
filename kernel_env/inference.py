@@ -36,7 +36,7 @@ def get_llm_response(client: OpenAI, prompt: str) -> str:
 def run_inference():
     # Initialize OpenAI client with HF Token (if applicable)
     client = OpenAI(
-        api_base_url=API_BASE_URL,
+        base_url=API_BASE_URL,
         api_key=HF_TOKEN,
     )
 
