@@ -12,7 +12,14 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import KernelAction, KernelObservation
+try:
+    from models import KernelAction, KernelObservation
+except ImportError:
+    try:
+        from .models import KernelAction, KernelObservation
+    except ImportError:
+        from kernel_env.models import KernelAction, KernelObservation
+
 
 
 class KernelEnv(
