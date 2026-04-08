@@ -53,6 +53,12 @@ app = create_app(
 )
 
 
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Docker/Hugging Face."""
+    return {"status": "ok"}
+
+
 def main(host: str = "0.0.0.0", port: int = 8000):
     """
     Entry point for direct execution via uv run or python -m.
