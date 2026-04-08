@@ -1,0 +1,2 @@
+[console_scripts]
+server = kernel_env.server.app:main

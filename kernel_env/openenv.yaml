@@ -1,0 +1,18 @@
+spec_version: 1
+name: sysadmin_troubleshooter
+title: SysAdmin Troubleshooting Environment
+description: A real-world RL environment where an agent acts as a Junior SysAdmin to identify and fix processes, services, and configuration errors.
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+tasks:
+  - id: task_1_kill_rogue
+    name: Kill Rogue Process
+    difficulty: easy
+  - id: task_2_nginx_active
+    name: Start Nginx Service
+    difficulty: medium
+  - id: task_3_nginx_config_fixed
+    name: Fix Nginx Config Typo
+    difficulty: hard
