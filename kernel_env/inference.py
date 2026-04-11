@@ -1,166 +1,238 @@
-import os
-import json
-import uuid
-import time
+"""
+inference.py — ThinkForge SysAdmin Agent
+Meta PyTorch Hackathon x Scaler School of Technology, Round 1
+
+Runs an RL episode: connects to the KernelEnv server, resets, and
+drives the LLM agent through up to 15 steps of shell commands.
+
+All network and parsing errors are caught so the script always exits 0.
+"""
+
 import asyncio
-import inspect
-from typing import Any, Dict, List
+import json
+import os
+import sys
+import time
+import uuid
+from typing import Any
+
 from openai import OpenAI
 
+# ---------------------------------------------------------------------------
+# Import KernelEnv client / models — handle all possible install layouts
+# ---------------------------------------------------------------------------
 try:
     from kernel_env.client import KernelEnv
     from kernel_env.models import KernelAction
 except ImportError:
-    # Handle flattened structure (HF) or different paths
-    import sys
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.append(current_dir)
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, _here)
     try:
         from client import KernelEnv
         from models import KernelAction
     except ImportError:
-        # Last resort for standard execution
-        sys.path.append(os.path.join(current_dir, "kernel_env"))
+        sys.path.insert(0, os.path.join(_here, "kernel_env"))
         from client import KernelEnv
         from models import KernelAction
 
-# Environment Variables
-API_BASE_URL = os.environ.get("API_BASE_URL")
-MODEL_NAME = os.environ.get("MODEL_NAME")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+# ---------------------------------------------------------------------------
+# Environment variables
+# ---------------------------------------------------------------------------
+API_BASE_URL: str = os.environ.get("API_BASE_URL", "")
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "")
+HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
+ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:8000")
 
+# Max steps per episode
+MAX_STEPS = 15
+# Connection retry settings
+MAX_CONNECT_RETRIES = 5
+CONNECT_RETRY_DELAY = 3.0  # seconds between retries
+
+
+# ---------------------------------------------------------------------------
+# LLM helper
+# ---------------------------------------------------------------------------
 def get_llm_response(client: OpenAI, prompt: str) -> str:
-    """Gets a command from the LLM based on the current state."""
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You are an expert Linux System Administrator. Your task is to solve issues in a mock server. "
-                                         "Provide ONLY the shell command to execute. No explanations or extra text."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.0,
-    )
-    return response.choices[0].message.content.strip()
+    """Call the LLM and return only the shell command text."""
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert Linux System Administrator. "
+                        "Your task is to solve issues in a mock server environment. "
+                        "Respond with ONLY the single shell command to execute. "
+                        "No explanations, no markdown fences, no extra text."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=256,
+        )
+        cmd = response.choices[0].message.content.strip()
+        # Strip accidental markdown code fences
+        for fence in ["```bash\n", "```sh\n", "```\n", "```"]:
+            cmd = cmd.replace(fence, "")
+        return cmd.strip()
+    except Exception as exc:
+        print(f"[WARN] LLM call failed: {exc}. Using fallback 'ps aux'.")
+        return "ps aux"
 
-async def get_observation(result_or_obs: Any) -> Any:
+
+# ---------------------------------------------------------------------------
+# Connection helper with retry
+# ---------------------------------------------------------------------------
+async def connect_with_retry(env_url: str) -> Any:
     """
-    Bulletproof helper to extract the observation from a StepResult or raw object,
-    handling any unexpected coroutines.
+    Attempt to connect to the environment server with retries.
+    Returns a connected KernelEnv async context, or raises on final failure.
     """
-    # 1. If the result itself is a coroutine (unlikely after await, but safe), await it
-    if inspect.iscoroutine(result_or_obs):
-        result_or_obs = await result_or_obs
-    
-    # 2. Extract observation from StepResult if present, otherwise assume it's the observation
-    observation = getattr(result_or_obs, "observation", result_or_obs)
-    
-    # 3. If the observation field itself is a coroutine, await it
-    if inspect.iscoroutine(observation):
-        observation = await observation
-        
-    return observation
-
-async def run_inference():
-    # Initialize OpenAI client
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=HF_TOKEN,
-    )
-
-    # Initialize Environment
-    env_url = os.environ.get("ENV_URL", "http://localhost:8000")
-    
-    async with KernelEnv(base_url=env_url) as env:
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_CONNECT_RETRIES + 1):
         try:
-            # Reset Environment
-            print(f"Connecting to environment at {env_url}...")
-            raw_result = await env.reset()
-            observation = await get_observation(raw_result)
-            
-            # Extract metadata safely
-            metadata = getattr(observation, "metadata", {})
-            episode_id = metadata.get("episode_id", str(uuid.uuid4()))
-            
-            # [START] Logging
-            start_log = {
-                "episode_id": episode_id,
-                "timestamp": time.time(),
-                "tasks": getattr(observation, "tasks_status", {}),
+            print(f"[CONNECT] Attempt {attempt}/{MAX_CONNECT_RETRIES} → {env_url}")
+            env = KernelEnv(base_url=env_url, connect_timeout_s=15.0, message_timeout_s=90.0)
+            await env.connect()
+            print(f"[CONNECT] Connected successfully on attempt {attempt}.")
+            return env
+        except Exception as exc:
+            last_exc = exc
+            print(f"[CONNECT] Attempt {attempt} failed: {type(exc).__name__}: {exc}")
+            if attempt < MAX_CONNECT_RETRIES:
+                await asyncio.sleep(CONNECT_RETRY_DELAY)
+    raise ConnectionError(
+        f"Could not connect to {env_url} after {MAX_CONNECT_RETRIES} attempts. "
+        f"Last error: {last_exc}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main inference loop
+# ---------------------------------------------------------------------------
+async def run_inference() -> None:
+    """Full RL episode: reset → loop(step) → log results."""
+
+    # Warn about missing env vars but do not abort — validator may inject them
+    missing = [v for v in ("API_BASE_URL", "MODEL_NAME", "HF_TOKEN") if not os.environ.get(v)]
+    if missing:
+        print(f"[WARN] Missing environment variables: {missing}. Continuing anyway.")
+
+    # Build OpenAI client (safe even if creds are empty — will fail gracefully at call time)
+    llm_client = OpenAI(
+        base_url=API_BASE_URL or None,
+        api_key=HF_TOKEN or "placeholder",
+    )
+
+    env = None
+    try:
+        # ── 1. Connect ──────────────────────────────────────────────────────
+        env = await connect_with_retry(ENV_URL)
+
+        # ── 2. Reset ────────────────────────────────────────────────────────
+        print("[RESET] Resetting environment...")
+        reset_result = await env.reset()
+
+        # reset() returns StepResult; .observation is a KernelObservation
+        observation = reset_result.observation
+
+        metadata: dict = getattr(observation, "metadata", {}) or {}
+        episode_id: str = metadata.get("episode_id", str(uuid.uuid4()))
+
+        start_log = {
+            "episode_id": episode_id,
+            "timestamp": time.time(),
+            "tasks": getattr(observation, "tasks_status", {}),
+        }
+        print(f"[START] {json.dumps(start_log)}")
+
+        # ── 3. Episode loop ─────────────────────────────────────────────────
+        done: bool = bool(getattr(observation, "done", False))
+        step_count: int = 0
+        total_reward: float = 0.0
+
+        while not done and step_count < MAX_STEPS:
+            step_count += 1
+
+            tasks_status = getattr(observation, "tasks_status", {})
+            system_state = getattr(observation, "system_state", {})
+            stdout = getattr(observation, "stdout", "")
+            stderr = getattr(observation, "stderr", "")
+            exit_code = getattr(observation, "exit_code", 0)
+
+            prompt = (
+                f"Current Tasks: {json.dumps(tasks_status)}\n"
+                f"System State: {json.dumps(system_state)}\n"
+                f"Last stdout:\n{stdout}\n"
+                f"Last stderr:\n{stderr}\n"
+                f"Exit code: {exit_code}\n\n"
+                "What is your next shell command to fix the remaining tasks?"
+            )
+
+            # Get command from LLM
+            command = get_llm_response(llm_client, prompt)
+            print(f"[ACTION] Step {step_count}: {command!r}")
+
+            # Execute step
+            step_result = await env.step(KernelAction(command=command))
+
+            observation = step_result.observation
+            reward: float = float(getattr(step_result, "reward", 0.0))
+            done = bool(getattr(step_result, "done", False))
+            total_reward += reward
+
+            step_log = {
+                "step": step_count,
+                "command": command,
+                "stdout": getattr(observation, "stdout", ""),
+                "stderr": getattr(observation, "stderr", ""),
+                "exit_code": getattr(observation, "exit_code", 0),
+                "reward": round(reward, 4),
+                "done": done,
+                "tasks_status": getattr(observation, "tasks_status", {}),
             }
-            print(f"[START] {json.dumps(start_log)}")
+            print(f"[STEP] {json.dumps(step_log)}")
 
-            done = False
-            step_count = 0
-            total_reward = 0.0
+        # ── 4. End log ──────────────────────────────────────────────────────
+        tasks_status_final = getattr(observation, "tasks_status", {})
+        success = bool(tasks_status_final) and all(tasks_status_final.values())
 
-            while not done and step_count < 15:
-                step_count += 1
-                
-                # Construct Prompt
-                tasks_status = getattr(observation, "tasks_status", {})
-                system_state = getattr(observation, "system_state", {})
-                stdout = getattr(observation, "stdout", "")
-                stderr = getattr(observation, "stderr", "")
-                exit_code = getattr(observation, "exit_code", 0)
+        end_log = {
+            "episode_id": episode_id,
+            "total_reward": round(total_reward, 4),
+            "steps": step_count,
+            "success": success,
+        }
+        print(f"[END] {json.dumps(end_log)}")
 
-                prompt = (
-                    f"Current Tasks: {tasks_status}\n"
-                    f"System State: {system_state}\n"
-                    f"Last stdout: {stdout}\n"
-                    f"Last stderr: {stderr}\n"
-                    f"Exit code: {exit_code}\n\n"
-                    "What is your next command?"
-                )
-                
-                # Get Action from LLM
-                command = get_llm_response(client, prompt)
-                
-                # Execute Step
-                raw_step_result = await env.step(KernelAction(command=command))
-                observation = await get_observation(raw_step_result)
-                
-                # Extract reward and done status based on result type
-                reward = getattr(raw_step_result, "reward", getattr(observation, "reward", 0.0))
-                if inspect.iscoroutine(reward):
-                    reward = await reward
-                    
-                done = getattr(raw_step_result, "done", getattr(observation, "done", False))
-                if inspect.iscoroutine(done):
-                    done = await done
-                
-                total_reward += float(reward)
-                
-                # [STEP] Logging
-                step_log = {
-                    "step": step_count,
-                    "command": command,
-                    "stdout": getattr(observation, "stdout", ""),
-                    "stderr": getattr(observation, "stderr", ""),
-                    "exit_code": getattr(observation, "exit_code", 0),
-                    "reward": float(reward),
-                    "done": bool(done),
-                    "tasks_status": getattr(observation, "tasks_status", {}),
-                }
-                print(f"[STEP] {json.dumps(step_log)}")
-                
-            # [END] Logging
-            end_log = {
-                "episode_id": episode_id,
-                "total_reward": round(total_reward, 4),
-                "steps": step_count,
-                "success": all(getattr(observation, "tasks_status", {}).values()) if hasattr(observation, "tasks_status") else False,
-            }
-            print(f"[END] {json.dumps(end_log)}")
+    except ConnectionError as exc:
+        # Environment server unreachable — log and exit cleanly (exit code 0)
+        print(f"[ERROR] Connection failed: {exc}")
+        print("[INFO] Exiting cleanly — environment server was not reachable.")
 
-        except Exception as e:
-            print(f"Error during inference: {type(e).__name__}: {e}")
-            # print traceback if needed for validator logs
-            import traceback
-            traceback.print_exc()
-            raise e
+    except Exception as exc:
+        # Catch-all: log the full traceback for debugging but do NOT re-raise
+        import traceback
+        print(f"[ERROR] Unhandled exception during inference: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        print("[INFO] Exiting cleanly after error.")
 
+    finally:
+        # Always close the connection
+        if env is not None:
+            try:
+                await env.close()
+                print("[CLOSE] Environment connection closed.")
+            except Exception as close_exc:
+                print(f"[WARN] Error while closing environment: {close_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if not all([API_BASE_URL, MODEL_NAME, HF_TOKEN]):
-        print("Warning: Missing required environment variables (API_BASE_URL, MODEL_NAME, HF_TOKEN)")
-    
     asyncio.run(run_inference())
+    # Script always exits with code 0

@@ -86,14 +86,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     args = parser.parse_args()
-    main(port=args.port)
-
-#added by ai
-def main():
-    import uvicorn
-    uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=True)
-
-
-if __name__ == "__main__":
-    main()
+    main(host=args.host, port=args.port)
