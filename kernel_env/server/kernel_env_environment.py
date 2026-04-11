@@ -14,12 +14,101 @@ from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
+from openenv.core.rubrics.base import Rubric
 
 try:
     from ..models import KernelAction, KernelObservation
 except ImportError:
     from models import KernelAction, KernelObservation
 
+
+# ---------------------------------------------------------------------------
+# Per-task Rubrics — scores STRICTLY in (0, 1): 0.1 = not done, 0.9 = done
+# ---------------------------------------------------------------------------
+
+class Task1KillRogueRubric(Rubric):
+    """
+    Grader for Task 1: Kill the rogue_app process.
+
+    Score is strictly between 0 and 1:
+      0.1 — rogue_app is still running (task not done)
+      0.9 — rogue_app has been killed (task done)
+    """
+
+    def forward(self, action: Any, observation: Any) -> float:
+        tasks: Dict = getattr(observation, "tasks_status", {}) or {}
+        done: bool = bool(tasks.get("task_1_kill_rogue", False))
+        # Never return exactly 0.0 or 1.0 — strictly in (0, 1)
+        return 0.9 if done else 0.1
+
+
+class Task2NginxActiveRubric(Rubric):
+    """
+    Grader for Task 2: Start the nginx service.
+
+    Score is strictly between 0 and 1:
+      0.1 — nginx is still inactive (task not done)
+      0.9 — nginx is active (task done)
+    """
+
+    def forward(self, action: Any, observation: Any) -> float:
+        tasks: Dict = getattr(observation, "tasks_status", {}) or {}
+        done: bool = bool(tasks.get("task_2_nginx_active", False))
+        return 0.9 if done else 0.1
+
+
+class Task3NginxConfigRubric(Rubric):
+    """
+    Grader for Task 3: Fix the nginx config typo ('liten' -> 'listen').
+
+    Score is strictly between 0 and 1:
+      0.1 — typo still present (task not done)
+      0.5 — typo fixed but nginx not yet restarted (partial credit)
+      0.9 — typo fixed and nginx is active (task fully done)
+    """
+
+    def forward(self, action: Any, observation: Any) -> float:
+        tasks: Dict = getattr(observation, "tasks_status", {}) or {}
+        state: Dict = getattr(observation, "system_state", {}) or {}
+
+        config_fixed: bool = bool(tasks.get("task_3_nginx_config_fixed", False))
+        nginx_active: bool = "nginx" in (state.get("active_services") or [])
+
+        if config_fixed and nginx_active:
+            return 0.9   # fully done
+        elif config_fixed:
+            return 0.5   # typo fixed, nginx not yet started
+        else:
+            return 0.1   # nothing done yet
+
+
+class SysAdminRubric(Rubric):
+    """
+    Master rubric for the SysAdmin environment.
+
+    Aggregates 3 per-task child rubrics with weighted scoring.
+    Weights: task_1=0.20, task_2=0.30, task_3=0.50
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Registering as attributes auto-registers them as named children
+        self.task_1_kill_rogue = Task1KillRogueRubric()
+        self.task_2_nginx_active = Task2NginxActiveRubric()
+        self.task_3_nginx_config_fixed = Task3NginxConfigRubric()
+
+    def forward(self, action: Any, observation: Any) -> float:
+        s1 = self.task_1_kill_rogue(action, observation)
+        s2 = self.task_2_nginx_active(action, observation)
+        s3 = self.task_3_nginx_config_fixed(action, observation)
+        # Weighted aggregate — also stays strictly in (0, 1)
+        score = s1 * 0.20 + s2 * 0.30 + s3 * 0.50
+        return round(score, 4)
+
+
+# ---------------------------------------------------------------------------
+# Mock Linux system simulator
+# ---------------------------------------------------------------------------
 
 class MockSystem:
     """Simulates a Linux-like system state for safely running SysAdmin tasks."""
@@ -93,7 +182,7 @@ class MockSystem:
                 output = f"● {service}.service\n   Loaded: loaded\n   Active: {status}\n"
                 return output, "", 0
             elif action == "start":
-                # Special check for nginx: if config is broken, it fails to start
+                # nginx fails if config has typo
                 if service == "nginx" and "liten" in self.files.get("/etc/nginx/nginx.conf", ""):
                     return "", "Job for nginx.service failed because the control process exited with error-code.", 1
                 self.services[service]["status"] = "active"
@@ -116,17 +205,17 @@ class MockSystem:
             return "", f"cat: {path}: No such file or directory", 1
 
         elif cmd == "sed":
-            # Very simple implementation for 'sed -i 's/old/new/g' file'
+            # Simple implementation for 'sed -i 's/old/new/g' file'
             if "-i" in args:
                 try:
                     pattern_idx = args.index("-i") + 1
                     file_idx = pattern_idx + 1
                     pattern = args[pattern_idx]
                     path = args[file_idx]
-                    
+
                     if path not in self.files:
                         return "", f"sed: can't read {path}: No such file or directory", 2
-                        
+
                     match = re.match(r"s/(.*)/(.*)/g", pattern.strip("'"))
                     if match:
                         old, new = match.groups()
@@ -139,9 +228,20 @@ class MockSystem:
         return "", f"bash: {cmd}: command not found", 127
 
 
+# ---------------------------------------------------------------------------
+# KernelEnvironment
+# ---------------------------------------------------------------------------
+
 class KernelEnvironment(Environment):
     """
     Real-world SysAdmin troubleshooting environment.
+
+    The agent must:
+      1. [Easy]   Kill the rogue_app process (PID 1024)
+      2. [Medium] Start the nginx service
+      3. [Hard]   Fix the typo in /etc/nginx/nginx.conf and restart nginx
+
+    Each task is scored by a dedicated Rubric child (score strictly in (0,1)).
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -153,7 +253,8 @@ class KernelEnvironment(Environment):
         transform: Optional[Any] = None,
         rubric: Optional[Any] = None,
     ):
-        super().__init__(transform=transform, rubric=rubric)
+        # Always use SysAdminRubric (override any passed-in rubric)
+        super().__init__(transform=transform, rubric=SysAdminRubric())
         self._max_steps = max_steps
         self._reset_count = 0
         self._terminated = False
@@ -187,8 +288,12 @@ class KernelEnvironment(Environment):
         }
 
     def _compute_reward(self) -> float:
+        """
+        Per-step reward: incremental progress since last step.
+        Returns a value in [0, 1). Never exactly 1.0 (max 0.5+0.3+0.2=1.0
+        but cumulative prevents reaching exact 1.0 in a single step).
+        """
         status = self._get_tasks_status()
-        # Weights: 0.2, 0.3, 0.5
         reward = 0.0
         if status["task_1_kill_rogue"]:
             reward += 0.2
@@ -196,12 +301,8 @@ class KernelEnvironment(Environment):
             reward += 0.3
         if status["task_3_nginx_config_fixed"]:
             reward += 0.5
-            
-        # We return the total progress as the reward (normalized 0-1)
-        # However, OpenEnv usually expects per-step reward or cumulative.
-        # Let's make it cumulative-friendly.
-        current_progress = reward
-        step_reward = max(0.0, current_progress - self._cumulative_reward)
+
+        step_reward = max(0.0, reward - self._cumulative_reward)
         return round(step_reward, 4)
 
     def reset(
@@ -219,7 +320,14 @@ class KernelEnvironment(Environment):
         self._state = self._build_state(episode_id=episode_id or str(uuid4()))
 
         return KernelObservation(
-            stdout="System boot complete. Welcome to SysAdmin Shell.\nTasks:\n1. [Easy] Kill the rogue_app process.\n2. [Medium] Start the nginx service.\n3. [Hard] Fix the typo in /etc/nginx/nginx.conf ('liten' -> 'listen') and restart nginx.",
+            stdout=(
+                "System boot complete. Welcome to SysAdmin Shell.\n"
+                "Tasks:\n"
+                "1. [Easy]   Kill the rogue_app process (PID 1024).\n"
+                "2. [Medium] Start the nginx service.\n"
+                "3. [Hard]   Fix the typo in /etc/nginx/nginx.conf "
+                "('liten' -> 'listen') and restart nginx."
+            ),
             system_state=self._get_system_summary(),
             tasks_status=self._get_tasks_status(),
             done=False,
@@ -240,12 +348,12 @@ class KernelEnvironment(Environment):
             raise RuntimeError("episode is terminated; call reset() before step() again")
 
         self._state.step_count += 1
-        
+
         stdout, stderr, exit_code = self._system.run_command(action.command)
-        
+
         step_reward = self._compute_reward()
         self._cumulative_reward += step_reward
-        
+
         tasks = self._get_tasks_status()
         self._terminated = (self._state.step_count >= self._max_steps) or all(tasks.values())
 
@@ -263,7 +371,7 @@ class KernelEnvironment(Environment):
                 "cumulative_reward": round(self._cumulative_reward, 4),
             },
         )
-        
+
         self._state = self._build_state(
             episode_id=self._state.episode_id,
             step_count=self._state.step_count,
@@ -277,5 +385,8 @@ class KernelEnvironment(Environment):
 
     def get_metadata(self):
         metadata = super().get_metadata()
-        metadata.description = "A real-world SysAdmin troubleshooting environment where an agent identifies and fixes system issues using shell commands."
+        metadata.description = (
+            "A real-world SysAdmin troubleshooting environment where an agent "
+            "identifies and fixes system issues using shell commands."
+        )
         return metadata
